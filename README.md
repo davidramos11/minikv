@@ -1,25 +1,33 @@
 # minikv
 
-A Redis-style in-memory key-value store written in C++17, built from scratch on raw POSIX sockets with no external dependencies.
+A small Redis-style key-value store written in C++. You connect to it over TCP, store and read values with commands like `SET` and `GET`, give keys an expiration time, and your data is still there after a restart.
 
-- **TCP server**: multiple clients connect at once and send text commands (`SET`, `GET`, `DEL`, `EXPIRE`, …)
-- **LRU eviction**: when memory hits `--max-keys`, the least-recently-used key is evicted in O(1)
-- **TTL expiry**: keys can expire, cleaned up both lazily (on read) and actively (background sweep)
-- **Persistence**: an append-only file (AOF) logs every write, and data is rebuilt on restart
-- **Thread-safe**: one thread per client, with a mutex making each command atomic
-- **Tested**: 77 unit-test checks, clean under AddressSanitizer, UBSan and ThreadSanitizer
+I built this to understand data structures on a deeper level than solving problems in class. Using a hash map is easy. I wanted to see what it takes to turn one into something real: what happens when memory fills up, how keys expire on time, and how you avoid losing everything when the program crashes. Redis handles all of that, so I used it as a model and built a much smaller version.
 
-## Quick start (macOS / Linux)
+The trickiest part was making sure the data comes back exactly the same after a restart, including which keys had been evicted.
+
+## How it works
+
+The core is a hash map combined with a doubly linked list. The map gives O(1) lookups, and the list keeps keys in order of when they were last used. Each map entry stores a pointer (iterator) to its spot in the list, so moving a key to the front on every access is O(1), and so is evicting the least recently used key from the back when the store is full.
+
+Keys with a TTL get deleted in two ways: when someone tries to read them after they expire, and by a background thread that sweeps once a second.
+
+Every command that changes data is appended to a log file (`minikv.aof`). On startup the server replays that file from the top to rebuild its state.
+
+Each client connection gets its own thread, and a single mutex makes sure only one command runs at a time.
+
+## Running it
+
+You need a C++17 compiler and CMake (on a Mac: `xcode-select --install` and `brew install cmake`).
 
 ```bash
-# needs a C++17 compiler and CMake (macOS: xcode-select --install && brew install cmake)
 cmake -S . -B build
 cmake --build build
-./build/minikv_tests          # run unit tests
-./build/minikv                # start server on 127.0.0.1:6380
+./build/minikv_tests     # run the tests
+./build/minikv           # start the server on 127.0.0.1:6380
 ```
 
-In a second terminal:
+Then in another terminal:
 
 ```
 $ nc localhost 6380
@@ -31,102 +39,53 @@ SET session abc123 EX 30
 OK
 TTL session
 (integer) 30
-INFO
-keys:2 max_keys:100000 evictions:0 persistence:aof
 ```
 
-Stop the server (Ctrl+C), start it again, and `GET greeting` still works.
+Options: `--port N` (default 6380), `--max-keys N` (default 100000), `--aof PATH` (default `minikv.aof`), `--no-aof` to keep everything in memory only.
 
-### Options
+## Commands
 
-| Flag | Default | Meaning |
-|------|---------|---------|
-| `--port N` | 6380 | TCP port (localhost only) |
-| `--max-keys N` | 100000 | evict LRU keys beyond this count |
-| `--aof PATH` | `minikv.aof` | persistence file |
-| `--no-aof` | | in-memory only |
+| Command | What it does |
+|---------|--------------|
+| `PING` | returns `PONG` |
+| `SET key value [EX sec \| PX ms]` | stores a value, optionally with an expiration |
+| `GET key` | returns the value or `(nil)` |
+| `DEL key [key ...]` | deletes keys, returns how many were deleted |
+| `EXISTS key [key ...]` | returns how many of the keys exist |
+| `EXPIRE key sec` | sets an expiration on an existing key |
+| `TTL key` / `PTTL key` | time left in seconds / ms (`-1` = no expiration, `-2` = no key) |
+| `DBSIZE` | number of keys |
+| `INFO` | key count, capacity, evictions |
+| `FLUSHALL` | deletes everything |
+| `QUIT` | closes the connection |
 
-### Commands
+Values with spaces go in double quotes.
 
-| Command | Reply |
-|---------|-------|
-| `PING [msg]` | `PONG` or `msg` |
-| `SET key value [EX sec \| PX ms]` | `OK` |
-| `GET key` | value or `(nil)` |
-| `DEL key [key ...]` | `(integer)` number deleted |
-| `EXISTS key [key ...]` | `(integer)` number that exist |
-| `EXPIRE key sec` | `(integer) 1` if set, `0` if no such key |
-| `TTL key` / `PTTL key` | seconds / ms left, `-1` no expiry, `-2` no key |
-| `DBSIZE` | `(integer)` key count |
-| `INFO` | stats line |
-| `FLUSHALL` | `OK` (deletes everything) |
-| `QUIT` | `OK`, closes connection |
+## Code layout
 
-Values with spaces go in double quotes. `\"`, `\\` and `\n` escapes are supported.
+| File | What's in it |
+|------|--------------|
+| `src/store.*` | the hash map + LRU list + TTL logic |
+| `src/protocol.*` | splitting a line of text into arguments |
+| `src/database.*` | command handling, locking, deciding what to log |
+| `src/aof.*` | writing and replaying the log file |
+| `src/server.*` | sockets and client threads |
+| `src/main.cpp` | command-line flags and startup |
+| `tests/test_main.cpp` | unit tests |
+| `bench/bench.py` | load-testing script |
 
-## Architecture
+## A couple of design notes
 
-```
- client (nc / bench.py)
-        │  TCP, one command per line
-        ▼
- ┌──────────────┐  server.cpp: accept loop, one thread per client,
- │    Server    │  buffers bytes into complete lines
- └──────┬───────┘
-        │ tokenize()  (protocol.cpp)
-        ▼
- ┌──────────────┐  database.cpp: command dispatch, holds the mutex,
- │   Database   │  decides what gets written to the AOF
- └──┬────────┬──┘
-    │        │
-    ▼        ▼
- ┌───────┐ ┌───────────┐
- │ Store │ │ AofWriter │  aof.cpp: append + flush each write;
- └───────┘ └───────────┘  replayed line by line on startup
- store.cpp: unordered_map + doubly linked list (LRU) + optional expiry time
-```
+Expiration times are saved to the log as absolute timestamps, not as "10 seconds from now." Otherwise every restart would give the key a fresh 10 seconds.
 
-| File | Responsibility |
-|------|----------------|
-| `src/store.*` | Data structure: hash map + LRU list + TTL. Single-threaded, clock injected for testing |
-| `src/protocol.*` | Parsing lines into arguments, quoting/escaping |
-| `src/database.*` | Commands, locking, deciding what to persist |
-| `src/aof.*` | Writing and replaying the append-only file |
-| `src/server.*` | Sockets and client threads |
-| `src/main.cpp` | Flags, startup, background expiry thread |
-| `tests/test_main.cpp` | Unit tests |
-| `bench/bench.py` | Load generator |
-
-## Design decisions
-
-**O(1) LRU with a hash map plus a linked list.** Each map entry stores an iterator to its node in a `std::list`. On access, `splice()` moves that node to the front in O(1), and eviction pops from the back in O(1).
-
-**Store isn't thread-safe, Database is.** Keeping the lock out of the data structure keeps `Store` simple and testable. A single mutex in `Database` makes each command atomic. The AOF is written while the lock is held, so the file's order always matches the order of changes in memory.
-
-**Absolute expiry times in the AOF.** `SET k v EX 10` is logged as `SET k v PXAT <unix-ms>`. Logging "10 seconds" would give the key a fresh 10 seconds after every restart.
-
-**Evictions are logged as explicit `DEL`s.** LRU order depends on reads, which aren't logged. If replay let the store evict on its own, it could pick different victims. So replay runs with unlimited capacity and reapplies the exact `DEL`s instead.
-
-**Two kinds of expiry.** Lazy: an expired key is deleted when someone touches it. Active: a background thread sweeps once per second, so keys nobody reads again still free their memory.
-
-**Crash tolerance.** A crash mid-write can leave a half-written last line. Replay skips malformed lines instead of refusing to start.
+Evictions are written to the log as explicit deletes. Which key gets evicted depends on which keys were read recently, and reads aren't logged. If the server re-ran evictions on its own during replay, it could throw out different keys than it did the first time.
 
 ## Benchmark
 
-`bench/bench.py` runs N concurrent clients doing SET/GET round trips:
+With 8 clients sending SET/GET requests (`python3 bench/bench.py --clients 8 --requests 40000`), on my MacBook it handled about 87,000 requests per second, with a median latency around 0.08 ms and zero errors.
 
-```bash
-./build/minikv --no-aof &
-python3 bench/bench.py --clients 8 --requests 40000
-```
+## What I'd improve next
 
-On a Linux cloud VM: **~26,000 req/s, p50 latency ~0.23 ms, p99 ~1.2 ms**, 0 errors (with AOF on). The Python client is likely the bottleneck. Run it on your own machine for your numbers.
-
-## Limitations and next steps
-
-- **Thread-per-client** doesn't scale to thousands of connections. Next step: a single-threaded event loop with `kqueue` (macOS) or `epoll` (Linux), which is the model Redis uses.
-- **One global lock**: commands run one at a time. Sharding the map into N buckets with N locks would let them run in parallel.
-- **AOF grows forever**: add compaction (rewrite the file from current state, like Redis's `BGREWRITEAOF`).
-- **flush, not fsync**: survives a process crash, not a power loss. Could add an "fsync every second" mode.
-- **Text protocol**: values can't contain raw newlines in replies. Redis's RESP protocol uses length prefixes to solve this.
-- **No auth**: listens on localhost only for that reason.
+- Replace thread-per-client with an event loop (`kqueue`/`epoll`) so it can handle thousands of connections
+- Split the store into shards with separate locks so commands can run in parallel
+- Compact the log file so it doesn't grow forever
