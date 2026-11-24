@@ -2,4 +2,3 @@ build/
 build-*/
 *.aof
 .vscode/
-INTERVIEW_PREP.md
